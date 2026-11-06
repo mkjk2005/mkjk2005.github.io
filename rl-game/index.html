@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Star Fleet Q-Learning</title>
+<script>
+// =====================================================================
+// REWARD FUNCTION — the points the captain gets for each move.
+// These numbers are what the agent tries to maximise. Change them on
+// the page and see how the learned behaviour changes.
+// =====================================================================
+const DEFAULT_R = { move: -1, bump: -5, ship: 50, blackHole: -50, outOfMoves: -20, closeness: 1 };
+const R = { ...DEFAULT_R };
+
+// Which reward rule is in use: "original" (default) or "progress"
+// "progress" is a proposed change that sounds sensible but can be gamed.
+let rewardRule = "original";
+
+function reward(event) {
+  let points = R.move;                          // every move costs (or pays) this much
+  if (event.bumped)      points += R.bump;      // flew into an asteroid or the map edge
+  if (event.reachedShip) points += R.ship;      // reached the ship: Earth is saved
+  if (event.blackHole)   points += R.blackHole; // fell into the black hole: game over
+  if (event.outOfMoves)  points += R.outOfMoves;// used all 30 moves without reaching the ship
+  // PROPOSED "progress bonus": credit for being near the ship on every move
+  // (10 = farthest possible distance, so the bonus is 0 there and biggest at the ship)
+  if (rewardRule === "progress") points += R.closeness * (10 - event.distance);
+  return points;
+}
+
+// =====================================================================
+// THE GAME
+// =====================================================================
+const SIZE = 6, MAX_MOVES = 30;
+// C = captain start, S = ship, # = asteroid (can't enter), O = black hole
+const MAP = [
+  ".....S",
+  "..#...",
+  "..#O..",
+  "#...#.",
+  "..#...",
+  "C.....",
+];
+const DIRS = [[-1, 0], [0, 1], [1, 0], [0, -1]]; // up, right, down, left
+const ARROWS = ["↑", "→", "↓", "←"];
+const START = findCell("C"), SHIP = findCell("S");
+
+function findCell(ch) {
+  for (let r = 0; r < SIZE; r++)
+    for (let c = 0; c < SIZE; c++) if (MAP[r][c] === ch) return { r, c };
+}
+
+// The state is just the captain's square: 6 x 6 = 36 states.
+const N_STATES = SIZE * SIZE;
+const stateOf = g => g.r * SIZE + g.c;
+
+function newGame() {
+  return { r: START.r, c: START.c, moves: 0, total: 0, done: false, outcome: "", last: null };
+}
+
+// Apply one move (action 0-3) to game g. Returns the points for that move.
+function step(g, action) {
+  const [dr, dc] = DIRS[action];
+  let nr = g.r + dr, nc = g.c + dc;
+  const e = { bumped: false, reachedShip: false, blackHole: false, outOfMoves: false };
+  // Off the map or into an asteroid: stay put
+  if (nr < 0 || nr >= SIZE || nc < 0 || nc >= SIZE || MAP[nr][nc] === "#") {
+    e.bumped = true; nr = g.r; nc = g.c;
+  }
+  g.r = nr; g.c = nc; g.moves++;
+  const cell = MAP[nr][nc];
+  if (cell === "S") e.reachedShip = true;
+  else if (cell === "O") e.blackHole = true;
+  else if (g.moves >= MAX_MOVES) e.outOfMoves = true;
+  e.distance = Math.abs(nr - SHIP.r) + Math.abs(nc - SHIP.c); // squares from the ship
+
+  const pts = reward(e);
+  g.total += pts;
+  g.last = pts;
+  g.done = e.reachedShip || e.blackHole || e.outOfMoves;
+  if (e.reachedShip) g.outcome = "ship";
+  else if (e.blackHole) g.outcome = "blackhole";
+  else if (e.outOfMoves) g.outcome = "timeout";
+  return pts;
+}
+
+// THE REAL GOAL: the captain reaches the ship within 30 moves (Earth is saved).
+// Points are only a stand-in for this; the chart tracks both separately.
+const achievedRealGoal = g => g.outcome === "ship";
+
+// =====================================================================
+// Q-LEARNING AGENT
+// =====================================================================
+const EPSILON = 0.2, ALPHA = 0.2, GAMMA = 0.95, SEED = 12345;
+
+// Seeded random numbers (mulberry32), so every run is reproducible
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+let Q, rng, history; // Q-table, training RNG, one record per training game
+
+function resetAgent() {
+  Q = Array.from({ length: N_STATES }, () => [0, 0, 0, 0]); // all Q-values start at 0
+  rng = makeRng(SEED);
+  history = [];
+}
+
+// Highest-valued action; ties broken at random
+function bestAction(s, rand) {
+  const q = Q[s], max = Math.max(...q);
+  const ties = [0, 1, 2, 3].filter(a => q[a] === max);
+  return ties[Math.floor(rand() * ties.length)];
+}
+
+// Epsilon-greedy: explore 20% of the time, otherwise take the best action
+function chooseAction(s) {
+  if (rng() < EPSILON) return Math.floor(rng() * 4);
+  return bestAction(s, rng);
+}
+
+// Play one training game, updating Q after every move
+function trainOneGame() {
+  const g = newGame();
+  while (!g.done) {
+    const s = stateOf(g);
+    const a = chooseAction(s);
+    const r = step(g, a);
+    const s2 = stateOf(g);
+    // Q-learning target: reward now + discounted best future value (none if game over)
+    const target = g.done ? r : r + GAMMA * Math.max(...Q[s2]);
+    Q[s][a] += ALPHA * (target - Q[s][a]);
+  }
+  history.push({ total: g.total, goal: achievedRealGoal(g) });
+}
+
+resetAgent();
+</script>
+<style>
+  :root {
+    --bg: #f6f7fb; --card: #fff; --ink: #1d2330; --muted: #5d6678; --line: #d9dde6;
+    --space: #0f1630; --cell: #1c2547; --accent: #2f6fdf; --gold: #e08a1e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  p.lead { color: var(--muted); margin: 0 0 18px; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+  @media (max-width: 760px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .wide { grid-column: 1 / -1; }
+
+  /* Night sky: dark blue with a layer of twinkling stars behind the squares */
+  .sky { position: relative; overflow: hidden; border-radius: 8px;
+         background: radial-gradient(circle at 30% 20%, #1a2550, var(--space) 70%);
+         width: 100%; max-width: 360px; aspect-ratio: 1; }
+  #stars { position: absolute; inset: 0; pointer-events: none; }
+  .star { position: absolute; border-radius: 50%; background: #fff;
+          box-shadow: 0 0 4px 1px rgba(200, 220, 255, .7);
+          animation: twinkle var(--dur) ease-in-out var(--delay) infinite; }
+  @keyframes twinkle { 0%, 100% { opacity: .2; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .star { animation: none; opacity: .7; } }
+  #board { position: relative; display: grid; grid-template-columns: repeat(6, 1fr);
+           grid-template-rows: repeat(6, 1fr); gap: 3px; padding: 6px; width: 100%; height: 100%; }
+  /* Squares are see-through so the stars show behind them */
+  .cell { background: rgba(40, 55, 110, .35); border: 1px solid rgba(140, 170, 255, .12);
+          border-radius: 4px; position: relative;
+          display: flex; align-items: center; justify-content: center; font-size: clamp(18px, 5vw, 28px); }
+  .cell .arrow { position: absolute; color: #8fb4ff; font-size: 0.7em; opacity: .75; }
+  .cell.here { outline: 2px solid #ffd257; }
+  .cell img.ship { width: 92%; height: auto; filter: drop-shadow(0 0 3px rgba(180, 210, 255, .6)); }
+  /* Fill the square without changing its size */
+  .cell img.captain { position: absolute; inset: 5%; width: 90%; height: 90%; object-fit: contain; }
+  .ship-inline { height: 1.2em; vertical-align: middle; }
+  .status { margin: 10px 0; }
+  .status b { font-variant-numeric: tabular-nums; }
+  #msg { min-height: 1.4em; font-weight: 600; }
+  .pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 4px; margin-top: 8px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+           background: #fff; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+
+  table.rw { border-collapse: collapse; width: 100%; }
+  table.rw td { padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  table.rw input { width: 80px; font: inherit; padding: 3px 6px; }
+  select { font: inherit; padding: 4px 6px; }
+  .hint { color: var(--muted); font-size: 0.9em; }
+  canvas { width: 100%; height: 300px; display: block; }
+  .legend { display: flex; gap: 18px; font-size: 0.9em; color: var(--muted); }
+  .sw { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Star Fleet: Reach the Ship</h1>
+  <p class="lead">The captain <img class="ship-inline" src="captain.png" alt=""> has at most 30 moves to reach the ship <img class="ship-inline" src="ship.png" alt=""> and save Earth.
+    Asteroids 🪨 block the way and the black hole 🕳️ ends the game.</p>
+
+  <div class="cols">
+    <!-- 1. The game -->
+    <section class="card">
+      <h2>1. Play the game</h2>
+      <div class="sky"><div id="stars"></div><div id="board"></div></div>
+      <div class="status">
+        Moves: <b id="moves">0</b> / 30 &nbsp;·&nbsp; Score: <b id="score">0</b>
+        &nbsp;·&nbsp; Last move: <b id="last">–</b>
+        <div id="msg"></div>
+      </div>
+      <div class="pad">
+        <span></span><button data-a="0" class="mv">↑</button><span></span>
+        <button data-a="3" class="mv">←</button><button data-a="2" class="mv">↓</button><button data-a="1" class="mv">→</button>
+      </div>
+      <div class="row">
+        <button id="newGame">New game</button>
+        <span class="hint">or use the arrow keys</span>
+      </div>
+    </section>
+
+    <!-- 2. Rewards -->
+    <section class="card">
+      <h2>2. Points for each move (the reward)</h2>
+      <div class="row">
+        <label for="rule">Reward rule:</label>
+        <select id="rule">
+          <option value="original">Original</option>
+          <option value="progress">Proposed: progress bonus</option>
+        </select>
+      </div>
+      <p class="hint" id="ruleNote"></p>
+      <table class="rw">
+        <tr><td>Every move</td><td><input type="number" data-k="move"></td></tr>
+        <tr><td>Bump into asteroid / edge</td><td><input type="number" data-k="bump"></td></tr>
+        <tr><td>Reach the ship</td><td><input type="number" data-k="ship"></td></tr>
+        <tr><td>Fall into the black hole</td><td><input type="number" data-k="blackHole"></td></tr>
+        <tr><td>Run out of moves</td><td><input type="number" data-k="outOfMoves"></td></tr>
+        <tr id="closenessRow" hidden><td>Progress bonus, per move<br>
+          <span class="hint">× (10 − squares from the ship)</span></td>
+          <td><input type="number" data-k="closeness"></td></tr>
+      </table>
+      <div class="row"><button id="defaults">Restore defaults</button></div>
+      <p class="hint">A move's points are “every move” plus whichever other lines apply.
+        After changing the numbers, press <b>Reset agent</b> so it learns from scratch.</p>
+
+      <h2 style="margin-top:18px">3. Q-learning agent</h2>
+      <div class="row">
+        <button id="train100" class="primary">Train 100 games</button>
+        <button id="train1000" class="primary">Train 1,000 games</button>
+      </div>
+      <div class="row">
+        <button id="watch">Watch it play</button>
+        <button id="resetAgent">Reset agent</button>
+        <label class="hint"><input type="checkbox" id="showPolicy" checked> show agent's best move on map</label>
+      </div>
+      <p class="hint" id="agentInfo"></p>
+      <p class="hint">Settings: exploration ε = 0.2, learning rate 0.2, discount 0.95,
+        Q-values start at 0, ties broken at random, random seed 12345.</p>
+    </section>
+
+    <!-- 4. Learning curve -->
+    <section class="card wide">
+      <h2>4. Learning curve (each point = 50 training games)</h2>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--accent)"></span>Average points per game (left axis)</span>
+        <span><span class="sw" style="background:var(--gold)"></span>% of games where the ship was reached — the real goal (right axis)</span>
+      </div>
+      <canvas id="chart"></canvas>
+      <p class="hint">Training games include 20% random exploring, so they never look perfect.
+        “Watch it play” shows the agent with exploring switched off.</p>
+    </section>
+  </div>
+</main>
+
+<script>
+// =====================================================================
+// PAGE / DISPLAY CODE
+// =====================================================================
+const $ = id => document.getElementById(id);
+let play = newGame();   // the game shown on the board
+let watching = false;
+
+const ICON = { "#": "🪨", "O": "🕳️" };
+
+// Scatter small twinkling stars in the background (decoration only).
+// Uses Math.random, not the agent's seeded RNG, so training is unaffected.
+function makeStars(n) {
+  const sky = $("stars");
+  for (let i = 0; i < n; i++) {
+    const s = document.createElement("span");
+    const size = 1 + Math.random() * 2;              // 1–3 px
+    s.className = "star";
+    s.style.left = Math.random() * 100 + "%";
+    s.style.top = Math.random() * 100 + "%";
+    s.style.width = s.style.height = size + "px";
+    s.style.setProperty("--dur", 2 + Math.random() * 4 + "s");      // twinkle speed
+    s.style.setProperty("--delay", -Math.random() * 6 + "s");       // out of sync
+    sky.appendChild(s);
+  }
+}
+makeStars(70);
+
+function drawBoard() {
+  const board = $("board");
+  board.innerHTML = "";
+  const trained = history.length > 0 && $("showPolicy").checked;
+  for (let r = 0; r < SIZE; r++) {
+    for (let c = 0; c < SIZE; c++) {
+      const div = document.createElement("div");
+      div.className = "cell";
+      const ch = MAP[r][c];
+      if (r === play.r && c === play.c) {
+        div.innerHTML = '<img class="captain" src="captain.png" alt="Captain">';
+        div.classList.add("here");
+      }
+      else if (ch === "S") div.innerHTML = '<img class="ship" src="ship.png" alt="Ship">';
+      else if (ICON[ch]) div.textContent = ICON[ch];
+      else if (trained) {
+        // Show the agent's current favourite move (first of any ties)
+        const q = Q[r * SIZE + c];
+        const span = document.createElement("span");
+        span.className = "arrow";
+        span.textContent = ARROWS[q.indexOf(Math.max(...q))];
+        div.appendChild(span);
+      }
+      board.appendChild(div);
+    }
+  }
+  $("moves").textContent = play.moves;
+  $("score").textContent = play.total;
+  $("last").textContent = play.last === null ? "–" : (play.last > 0 ? "+" : "") + play.last;
+  $("msg").textContent = {
+    ship: "🌍 Earth is saved! The captain reached the ship.",
+    blackhole: "💀 Lost in the black hole.",
+    timeout: "⏱ Out of moves. Earth is lost.",
+  }[play.outcome] || "";
+}
+
+function humanMove(a) {
+  if (watching || play.done) return;
+  step(play, a);
+  drawBoard();
+}
+
+document.querySelectorAll(".mv").forEach(b => b.onclick = () => humanMove(+b.dataset.a));
+document.addEventListener("keydown", e => {
+  const a = { ArrowUp: 0, ArrowRight: 1, ArrowDown: 2, ArrowLeft: 3 }[e.key];
+  if (a === undefined || e.target.tagName === "INPUT") return;
+  e.preventDefault();
+  humanMove(a);
+});
+$("newGame").onclick = () => { if (!watching) { play = newGame(); drawBoard(); } };
+
+// --- Reward controls ---
+const inputs = document.querySelectorAll("input[data-k]");
+function showRewards() { inputs.forEach(i => i.value = R[i.dataset.k]); }
+inputs.forEach(i => i.oninput = () => {
+  const v = parseFloat(i.value);
+  if (!isNaN(v)) R[i.dataset.k] = v;
+});
+$("defaults").onclick = () => { Object.assign(R, DEFAULT_R); setRule("original"); showRewards(); };
+
+// --- Reward rule switch (original vs. proposed progress bonus) ---
+const RULE_NOTES = {
+  original: "Points come only from moving, bumping, and how the game ends.",
+  progress: "Campaign pitch: “Reward momentum, not just the finish line. " +
+            "Every move earns extra points the closer the captain is to the ship.” " +
+            "Press Reset agent, then train, and compare the two lines on the chart.",
+};
+function setRule(rule) {
+  rewardRule = rule;
+  $("rule").value = rule;
+  $("closenessRow").hidden = rule !== "progress";
+  $("ruleNote").textContent = RULE_NOTES[rule];
+}
+$("rule").onchange = () => setRule($("rule").value);
+setRule("original");
+
+// --- Agent controls ---
+function train(n) {
+  for (let i = 0; i < n; i++) trainOneGame();
+  refreshAgent();
+}
+$("train100").onclick = () => train(100);
+$("train1000").onclick = () => train(1000);
+$("resetAgent").onclick = () => { resetAgent(); refreshAgent(); };
+$("showPolicy").onchange = drawBoard;
+
+// Watch one greedy game (no exploring), one move every 300 ms
+$("watch").onclick = () => {
+  if (watching) return;
+  watching = true; setButtons(false);
+  play = newGame(); drawBoard();
+  const watchRng = makeRng(SEED + 1); // separate RNG so watching doesn't change training
+  const timer = setInterval(() => {
+    step(play, bestAction(stateOf(play), watchRng));
+    drawBoard();
+    if (play.done) { clearInterval(timer); watching = false; setButtons(true); }
+  }, 300);
+};
+
+function setButtons(on) {
+  document.querySelectorAll("button").forEach(b => b.disabled = !on);
+}
+
+function refreshAgent() {
+  const n = history.length;
+  const recent = history.slice(-50);
+  const avg = recent.length ? recent.reduce((s, h) => s + h.total, 0) / recent.length : 0;
+  const pct = recent.length ? 100 * recent.filter(h => h.goal).length / recent.length : 0;
+  $("agentInfo").textContent = n === 0
+    ? "The agent hasn't trained yet."
+    : `Trained ${n.toLocaleString()} games. Last ${recent.length}: average ${avg.toFixed(1)} points, ship reached in ${pct.toFixed(0)}%.`;
+  drawBoard();
+  drawChart();
+}
+
+// --- Learning curve chart (plain canvas) ---
+function drawChart() {
+  const cv = $("chart"), dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = "12px system-ui, sans-serif";
+
+  // Average points and goal share for each full block of 50 games
+  const blocks = [];
+  for (let i = 0; i + 50 <= history.length; i += 50) {
+    const b = history.slice(i, i + 50);
+    blocks.push({
+      x: i + 50,
+      avg: b.reduce((s, h) => s + h.total, 0) / 50,
+      pct: 100 * b.filter(h => h.goal).length / 50,
+    });
+  }
+
+  const L = 52, Rm = 48, T = 14, B = 34;          // margins
+  const pw = W - L - Rm, ph = H - T - B;
+  ctx.strokeStyle = "#d9dde6"; ctx.fillStyle = "#5d6678";
+  ctx.strokeRect(L, T, pw, ph);
+
+  if (blocks.length === 0) {
+    ctx.textAlign = "center";
+    ctx.fillText("Train at least 50 games to see the curve.", L + pw / 2, T + ph / 2);
+    return;
+  }
+
+  // Left axis range (points), always including 0
+  let lo = Math.min(0, ...blocks.map(b => b.avg)), hi = Math.max(0, ...blocks.map(b => b.avg));
+  if (hi - lo < 1) hi = lo + 1;
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const maxX = blocks[blocks.length - 1].x;
+  const X = x => L + (maxX === 50 ? pw / 2 : (x - 50) / (maxX - 50) * pw);
+  const YL = v => T + (hi - v) / (hi - lo) * ph;
+  const YR = p => T + (100 - p) / 100 * ph;
+
+  // Grid lines and labels
+  ctx.textAlign = "right";
+  for (let k = 0; k <= 4; k++) {
+    const v = lo + (hi - lo) * k / 4, y = YL(v);
+    ctx.strokeStyle = "#eef0f4"; ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(L + pw, y); ctx.stroke();
+    ctx.fillStyle = "#2f6fdf"; ctx.fillText(v.toFixed(0), L - 6, y + 4);
+  }
+  ctx.textAlign = "left"; ctx.fillStyle = "#e08a1e";
+  for (let p = 0; p <= 100; p += 25) ctx.fillText(p + "%", L + pw + 6, YR(p) + 4);
+  ctx.textAlign = "center"; ctx.fillStyle = "#5d6678";
+  ctx.fillText("training games", L + pw / 2, H - 6);
+  ctx.fillText(maxX.toLocaleString(), L + pw, T + ph + 16);
+  ctx.fillText("50", L, T + ph + 16);
+
+  // Zero line for points
+  ctx.strokeStyle = "#b8bfcc"; ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(L, YL(0)); ctx.lineTo(L + pw, YL(0)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // The two lines
+  function line(color, ys) {
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath();
+    blocks.forEach((b, i) => (i ? ctx.lineTo : ctx.moveTo).call(ctx, X(b.x), ys(b)));
+    ctx.stroke();
+    if (blocks.length < 40) blocks.forEach(b => { ctx.beginPath(); ctx.arc(X(b.x), ys(b), 2.5, 0, 7); ctx.fill(); });
+    ctx.lineWidth = 1;
+  }
+  line("#2f6fdf", b => YL(b.avg));
+  line("#e08a1e", b => YR(b.pct));
+}
+
+window.addEventListener("resize", drawChart);
+showRewards();
+refreshAgent();
+</script>
+</body>
+</html>
